@@ -1,5 +1,4 @@
 import heapq
-import itertools
 import multiprocessing
 import os
 
@@ -13,7 +12,7 @@ def read_file(
     text_chunks = []
     with open(file_path, "rb") as f:
         for idx in range(0, len(chunk_pos) - 1):
-            start, end = idx, idx + 1
+            start, end = chunk_pos[idx], chunk_pos[idx + 1]
             length = end - start
             f.seek(start)
             chunked_text = f.read(length)
@@ -23,110 +22,95 @@ def read_file(
     return text_chunks
 
 
-def pretokenizer(raw_text: bytes) -> dict[bytes, list[int]]:
+def pretokenizer(raw_text: bytes) -> dict[tuple[bytes, ...], int]:
     # We just ignore the special tokens
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     matches = re.finditer(PAT, raw_text)
 
-    pre_tokens = []
+    split_dict = {}
     for match in matches:
         pre_token = match.group()
-        start = match.span()[0]
-        if pre_token not in pre_tokens:
-            pre_tokens[pre_token] = []
-        pre_tokens[pre_token].append(start)
+        result = tuple(bytes([x]) for x in pre_token)
+        if result not in split_dict:
+            split_dict[result] = 0
+        split_dict[result] += 1
 
-    return pre_tokens
+    return split_dict
 
 
 def init_pairs(
-    pre_tokens: dict[bytes, list[int]],
-) -> dict[tuple[bytes, bytes], tuple[int, list[int]]]:
+    splited_tokens: dict[tuple[bytes, ...], int],
+) -> dict[tuple[bytes, bytes], int]:
     pairs = {}
-    for token, start_list in pre_tokens.items():
+    for token, cnt in splited_tokens.items():
         if len(token) == 1:
             continue
-        cnt = len(start_list)
         for idx in range(0, len(token) - 1):
-            pair = (token[idx], token[idx + 1])
+            pair = (token[idx : idx + 1], token[idx + 1 : idx + 2])
             if pair not in pairs:
-                pairs[pair] = (0, [])
-
-            pair_cnt = pairs[pair][0]
-            pair_positions = pairs[pair][1]
-
-            pair_cnt += cnt
-            pair_positions.extend([i + idx for i in start_list])
-
-            pairs[pair] = (pair_cnt, pair_positions)
+                pairs[pair] = 0
+            pairs[pair] += cnt
 
     return pairs
 
 
 def merge(
     pairs_cnt_heap: heapq,
-    pairs: dict[tuple[bytes, bytes], tuple[int, list[int]]],
+    pairs: dict[tuple[bytes, bytes], int],
+    splited_dict: dict[tuple[bytes, ...], int],
     merge_pair: tuple[bytes, bytes],
-):
-    """
-    pairs: Dict[Key: token pair, Value: (count, [positions])]
-    Example:
-        pairs:
-            {
-                (ea, st), (2, [13, 25]),
-                (st, pip), (9, [15, ...]),
-                (st, new), (11, [27, ...]),
-                ...
-            }
-        merge:
-            (ea, st)
-
-    after merging:
-        pairs:
-            {
-                # there is no pair (ea, st) anymore...
-                (st, pip), (8, [36, ...]),      # next pair of (st, pip) will be at 36
-                (st, new), (10, [57, ...]),
-                (east, pip), (1, [15]),
-                (east, new), (1, [27]),
-                ...
-            }
-
-    """
+) -> dict[tuple[bytes, ...], int]:
     first_token, second_token = merge_pair
     new_token = b"".join(merge_pair)
-    cnt, merge_pair_positions = pairs[merge_pair]
-    second_token_positions = [
-        i + len(first_token) for i in merge_pair_positions
-    ]
-    pairs_begin_with_second_token = [
-        k for k in pairs.keys() if k[0] == second_token
-    ]
+    new_split_dict = {}
+    changed_pairs = set()
+    for word, cnt in splited_dict.items():
+        # word: (b"a", b"c", b"d")
+        new_word = []
+        idx = 0
+        while idx < len(word) - 1:
+            curr, next = word[idx], word[idx + 1]
+            if (curr != first_token) or (
+                curr == first_token and next != second_token
+            ):
+                new_word.append(word[idx])
+                idx += 1
+            if curr == first_token and next == second_token:
+                new_word.append(new_token)
 
-    for pair in pairs_begin_with_second_token:
-        cnt, positions = pairs[pair]
-        overlapped_positions = list(
-            set(second_token_positions) & set(positions)
-        )
-        if overlapped_positions:
-            # insert new pairs
-            pairs[(new_token, pair[1])] = (
-                len(overlapped_positions),
-                [i - len(first_token) for i in overlapped_positions],
-            )
-            # update old pairs
-            updated_positions = list(set(positions) - set(overlapped_positions))
-            updated_cnt = cnt - len(overlapped_positions)
-            if updated_cnt == 0:
-                del pairs[pair]
-            else:
-                pairs[pair] = (updated_cnt, updated_positions)
-                heapq.heappush((-updated_cnt, pair))
+                if idx > 0:
+                    prev_pair = (word[idx - 1], word[idx])
+                    new_prev_pair = (word[idx - 1], new_token)
+                    pairs[prev_pair] -= cnt
+                    if new_prev_pair not in pairs:
+                        pairs[new_prev_pair] = 0
+                    pairs[new_prev_pair] += cnt
+                    changed_pairs.update([prev_pair, new_prev_pair])
 
-    # delete merged pair
+                if idx < len(word) - 2:
+                    next_pair = (word[idx + 1], word[idx + 2])
+                    new_next_pair = (new_token, word[idx + 2])
+                    pairs[next_pair] -= cnt
+                    if new_next_pair not in pairs:
+                        pairs[new_next_pair] = 0
+                    pairs[new_next_pair] += cnt
+                    changed_pairs.update([next_pair, new_next_pair])
+
+                idx += 2
+        if idx < len(word):
+            new_word.append(word[idx])
+
+        new_key = tuple(new_word)
+        if new_key not in new_split_dict:
+            new_split_dict[new_key] = 0
+        new_split_dict[new_key] += cnt
+
+    for pair in changed_pairs:
+        heapq.heappush(pairs_cnt_heap, (-pairs[pair], pair))
+
     del pairs[merge_pair]
 
-    return None
+    return new_split_dict
 
 
 def my_train_bpe(
@@ -149,11 +133,16 @@ def my_train_bpe(
     with multiprocessing.Pool(processes=8) as pool:
         results = pool.map(pretokenizer, text_chunks)
 
-    pre_tokens = list(itertools.chain.from_iterable(results))
-    pairs = init_pairs(pre_tokens)
+    split_dict = {}
+    for res in results:
+        for splited, count in res.items():
+            if splited not in split_dict:
+                split_dict[splited] = 0
+            split_dict[splited] += count
 
+    pairs = init_pairs(split_dict)
     # We're using a MAX heap
-    pairs_heap = [(-count, pair) for pair, (count, _) in pairs]
+    pairs_heap = [(-count, pair) for pair, count in pairs]
     heapq.heapify(pairs_heap)
 
     merged_pairs = []
@@ -162,11 +151,11 @@ def my_train_bpe(
         count = -neg_count
         if pair_to_merge not in pairs:
             continue
-        real_count = pairs[pair_to_merge][0]
+        real_count = pairs[pair_to_merge]
         if real_count != count:
             continue
 
-        merge(pairs_heap, pairs, pair_to_merge)
+        split_dict = merge(pairs_heap, pairs, pair_to_merge)
 
         merged_pairs.append(pair_to_merge)
         # Note that vocab size is the newst token id
